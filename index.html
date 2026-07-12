@@ -1,0 +1,1688 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Heli Attack</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;overflow:hidden;background:#000;touch-action:none;user-select:none;-webkit-user-select:none}
+canvas{display:block;width:100%;height:100%;image-rendering:pixelated;image-rendering:crisp-edges}
+#loading{position:fixed;top:0;left:0;width:100%;height:100%;background:#111;color:#0f0;font:20px monospace;display:flex;align-items:center;justify-content:center;z-index:100}
+</style>
+</head>
+<body>
+<div id="loading">Loading assets...</div>
+<canvas id="game"></canvas>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/planck-js/1.0.3/planck.min.js"></script>
+<script>
+// ============ CONSTANTS ============
+const GRAVITY = -5.8;
+const CAM_WIDTH = 16;
+const PPM = 50; // pixels per meter (for rendering scale)
+
+const WEAP_NAMES = ["gun","missile","homming missile","big bomb","air support","super bomb","fuel","armor"];
+const SOUNDS_PATH = ["gun","missile","homming","bomb","air_sup","sup_bomb"];
+const GROUND_TILE_NAMES = ["center_ground","center_ground_left","center_ground_right","double_side","double_top","left_top_side","left_side","middle_ground","right_top_side","right_side"];
+const BACK_TEXTS = ["back5","back5","back5"];
+const BULLET_TEXTS = ["heli_gun_bullet","heli_big_missle","heli_hom_mis","heli_bomb","heli_super_bomb","heli_super_bomb"];
+const BULLET_SIZES = [[0.11,0.11],[0.3,0.18],[0.3,0.22],[0.25,0.19],[0.2,0.3],[0.35,0.35]];
+const BULLET_VELS = [[15.09,0],[8.09,0],[5.09,0],[0.09,-2],[0.19,-2],[0.29,-2]];
+const BULLET_ARMORS = [5,15,45,9,40,105];
+const BULLET_DAMAGES = [5,10,50,25,100,10000000];
+const BULLET_FRAME_COLS = [[1,1],[2,1],[2,1],[1,1],[1,1],[1,1]];
+
+// ============ GLOBALS ============
+let canvas, ctx;
+let planck = window.planck;
+let Vec2 = planck.Vec2;
+let world = planck.World({gravity:Vec2(0,GRAVITY)});
+let camera = {x:CAM_WIDTH/2,y:0,width:CAM_WIDTH,height:0};
+let screenW, screenH, camH, lengthUnit, heightUnit;
+let textures = {};
+let atlasData = {};
+let fontImg = null;
+let fontData = null;
+let loaded = false;
+let gameState = 'loading';
+
+// Game objects
+let plane = null;
+let vehicles = new Map();
+let bullets = new Map();
+let supplies = new Map();
+let spriteObjects = [];
+let staticBlocks = [];
+let dynamicBlocks = [];
+let groundTiles = [];
+let groundTilesMap = [];
+let groundVertices = [];
+let heightmap = [];
+let worldLength = 0;
+let box1 = null;
+let curHpoh = 0;
+let isPause = true;
+let isFinished = false;
+let totalCrash = false;
+let crashedEnemCount = 0;
+let genEnemyCount = 0;
+let genBulCount = 0;
+let firedBulCount = 0;
+let survivalMode = true;
+let finishDistance = 0;
+let joystickActive = false;
+let joystickPointer = -1;
+let joyAngle = 0;
+let joyBackX, joyBackY, joyBackW, joyBackH;
+let joyPointX, joyPointY, joyPointW, joyPointH;
+let keys = {left:false,right:false,up:false,down:false};
+
+// ============ CATEGORY BITS (match original game) ============
+const CAT_SUPPLY     = 0x0001;  // 1
+const CAT_ENEMY      = 0x0002;  // 2
+const CAT_ENEMY_ROCKET = 0x0004; // 3 -> bit 3
+const CAT_ENEMY_BULLET = 0x0008; // 4
+const CAT_PLAYER_BULLET = 0x0040; // 6
+const CAT_SUPPORT_AIRCRAFT = 0x0080; // 7
+const CAT_GROUND     = 0x0100;  // 8
+const CAT_HELICOPTER = 0x0200;  // 9
+
+// ============ BOX2D HELPERS ============
+function createBodyDef() { return new planck.BodyDef(); }
+function createFixtureDef() { return new planck.FixtureDef(); }
+function createPolygonShape() { return new planck.PolygonShape(); }
+
+// ============ ATLAS PARSER ============
+function parseLibgdxAtlas(text, basePath) {
+    let regions = {};
+    let lines = text.split('\n');
+    let currentPage = null;
+    let currentRegion = null;
+    for (let line of lines) {
+        line = line.trim();
+        if (!line) continue;
+        if (line.endsWith('.png') && !line.startsWith('  ')) {
+            currentPage = basePath + line;
+            continue;
+        }
+        if (line.startsWith('format:') || line.startsWith('filter:') || line.startsWith('repeat:')) continue;
+        if (!line.startsWith('  ')) {
+            if (currentRegion) regions[currentRegion.name] = currentRegion;
+            currentRegion = {name:line,page:currentPage,x:0,y:0,w:0,h:0,ow:0,oh:0,ox:0,oy:0,rotate:false};
+            continue;
+        }
+        if (!currentRegion) continue;
+        let [k,v] = line.trim().split(': ');
+        if (k==='rotate') currentRegion.rotate = v==='true';
+        else if (k==='xy') {let p=v.split(',');currentRegion.x=parseInt(p[0]);currentRegion.y=parseInt(p[1]);}
+        else if (k==='size') {let p=v.split(',');currentRegion.w=parseInt(p[0]);currentRegion.h=parseInt(p[1]);}
+        else if (k==='orig') {let p=v.split(',');currentRegion.ow=parseInt(p[0]);currentRegion.oh=parseInt(p[1]);}
+        else if (k==='offset') {let p=v.split(',');currentRegion.ox=parseInt(p[0]);currentRegion.oy=parseInt(p[1]);}
+    }
+    if (currentRegion) regions[currentRegion.name] = currentRegion;
+    return regions;
+}
+
+async function loadAtlas(path, name) {
+    let base = path.substring(0, path.lastIndexOf('/')+1);
+    let resp = await fetch(path);
+    let text = await resp.text();
+    let regions = parseLibgdxAtlas(text, base);
+    // Load unique pages
+    let pages = new Set();
+    for (let k in regions) pages.add(regions[k].page);
+    let pageImages = {};
+    for (let p of pages) {
+        let img = new Image();
+        img.crossOrigin = 'anonymous';
+        await new Promise((res,rej)=>{img.onload=res;img.onerror=rej;img.src=p;});
+        pageImages[p] = img;
+        textures[p] = img;
+    }
+    // Store regions with canvas-derived textures for each region
+    for (let k in regions) {
+        let r = regions[k];
+        let img = pageImages[r.page];
+        let c = document.createElement('canvas');
+        c.width = r.w;
+        c.height = r.h;
+        let cx = c.getContext('2d');
+        cx.drawImage(img, r.x, r.y, r.w, r.h, 0, 0, r.w, r.h);
+        textures[k] = c;
+        atlasData[k] = r;
+    }
+    console.log('Loaded atlas:', name, Object.keys(regions).length, 'regions');
+}
+
+// ============ USER DATA ============
+class UserData {
+    constructor(index, damage, type, name) {
+        this.index = index;
+        this.damage = damage;
+        this.type = type;
+        this.name = name;
+    }
+}
+
+// ============ IMAGE BUTTON ============
+class ImageButon {
+    constructor(pos, size, texName, cols, rows) {
+        this.pos = {x:pos[0],y:pos[1]};
+        this.size = {x:size[0],y:size[1]};
+        this.texName = texName;
+        this.visible = true;
+        this.index = 0;
+        this.frameTime = 0;
+        this.cols = cols||1;
+        this.rows = rows||1;
+        this.text = '';
+    }
+    draw(ctx, dt) {
+        if (!this.visible) return;
+        let tex = textures[this.texName];
+        if (!tex) return;
+        ctx.drawImage(tex, this.pos.x, this.pos.y, this.size.x, this.size.y);
+    }
+    inBounds(x, y) {
+        return this.visible && x>=this.pos.x && x<=this.pos.x+this.size.x && y>=this.pos.y && y<=this.pos.y+this.size.y;
+    }
+}
+
+// ============ SUPPLY ============
+class Supply {
+    constructor(pos, size, type, val) {
+        this.pos = {x:pos[0],y:pos[1]};
+        this.size = {x:size[0],y:size[1]};
+        this.type = type;
+        this.val = val;
+        this.ID = randomID();
+        this.exists = true;
+        this.onViewport = false;
+        this.armor = 20;
+        this.killedByHeli = false;
+        this.index = 0;
+        this.stateTime = 0;
+        this.frameInterval = 0.5;
+        this.FRAME_COLS = 4;
+        this.FRAME_ROWS = 1;
+        // physics
+        let bd = new planck.BodyDef();
+        bd.type = planck.Body.Dynamic;
+        bd.position = Vec2(pos[0], pos[1]);
+        this.body = world.createBody(bd);
+        let shape = new planck.PolygonShape();
+        shape.setAsBox(size[0]/2, size[1]/2);
+        let fd = new planck.FixtureDef();
+        fd.shape = shape;
+        fd.filterCategoryBits = CAT_SUPPLY;
+        fd.filterGroupIndex = 1;
+        fd.density = 1;
+        this.body.createFixture(fd).setUserData(new UserData(0, 100, '', ''));
+        this.body.setType(planck.Body.Static);
+    }
+    update(dt) {
+        let cp = camera;
+        let bx = this.body.getPosition().x;
+        if (bx < cp.x - cp.width*0.5 || bx > cp.x + cp.width*0.5) {
+            this.onViewport = false;
+            return;
+        }
+        this.onViewport = true;
+        if (this.armor <= 0) {
+            this.exists = false;
+        }
+        // apply upward force
+        this.body.applyForce(Vec2(0, -this.body.getMass() * 1.0 * GRAVITY), this.body.getWorldCenter());
+    }
+    draw(ctx) {
+        if (!this.exists) return;
+        let tex = textures[this.type];
+        if (!tex) return;
+        let p = this.body.getPosition();
+        ctx.drawImage(tex, this.pos.x - this.size.x/2, this.pos.y - this.size.y/2, this.size.x, this.size.y);
+    }
+}
+
+// ============ BULLET ============
+class Bullet {
+    constructor(pos, angle, vel, size, armorDamage, texName, firedTex, id, cols, rows, catBits) {
+        this.pos = {x:pos[0],y:pos[1]};
+        this.angle = angle;
+        this.vel = {x:vel[0],y:vel[1]};
+        this.size = {x:size[0],y:size[1]};
+        this.texName = texName;
+        this.id = id;
+        this.visible = true;
+        this.died = false;
+        this.bodyDel = false;
+        this.armor = armorDamage[0];
+        this.damage = armorDamage[1];
+        this.index = 0;
+        this.stateTime = 0;
+        this.frameTime = 0.05;
+        this.FRAME_COLS = cols;
+        this.FRAME_ROWS = rows;
+        this.isHomming = false;
+        this.needAscenPower = false;
+        this.forseValue = 0;
+        this.pauseTime = 0;
+        this.isRadio = false;
+        // physics
+        let bd = new planck.BodyDef();
+        bd.type = planck.Body.Dynamic;
+        bd.position = Vec2(pos[0], pos[1]);
+        this.body = world.createBody(bd);
+        this.body.setBullet(true);
+        let shape = new planck.PolygonShape();
+        shape.setAsBox(size[0]/2, size[1]/2);
+        let fd = new planck.FixtureDef();
+        fd.shape = shape;
+        fd.filterCategoryBits = catBits;
+        fd.filterGroupIndex = 1;
+        fd.density = 0;
+        fd.restitution = 0.5;
+        this.body.createFixture(fd).setUserData(new UserData(id, this.damage, '', ''));
+        this.body.setLinearVelocity(Vec2(vel[0], vel[1]));
+        this.body.setFixedRotation(true);
+        this.body.setAngularDamping(0.3);
+        if (Math.abs(vel[1]) < Math.abs(vel[0])) this.needAscenPower = true;
+    }
+    setVisible(v) {
+        this.visible = v;
+        this.index = 0;
+        this.stateTime = 0;
+    }
+    setDamage(d) { this.armor -= d; }
+    setHomming(on, force, pause) {
+        this.isHomming = on;
+        this.forseValue = force;
+        this.pauseTime = pause;
+    }
+    hommingFn() {
+        if (!this.visible) return;
+        this.pauseTime -= 1/60;
+        if (this.pauseTime <= 0) {
+            let target = getHommingTarget();
+            let myPos = this.body.getWorldCenter();
+            let dx = target.x - myPos.x;
+            let dy = target.y - myPos.y;
+            if (dx === 0) dx = 0.001;
+            let a = Math.atan(dy/dx);
+            if (dx < 0) a = -a;
+            if (dx <= 0) a = Math.PI - a;
+            this.vel.x = Math.cos(a) * this.forseValue;
+            this.vel.y = Math.sin(a) * this.forseValue;
+            this.body.setLinearVelocity(Vec2(this.vel.x, this.vel.y));
+            this.body.setTransform(this.body.getPosition(), a);
+        }
+    }
+    update() {
+        if (this.armor <= 0) this.visible = false;
+        if (this.needAscenPower) {
+            this.body.applyForce(Vec2(0, -this.body.getMass() * 0.99 * GRAVITY), this.body.getWorldCenter());
+        }
+        if (this.isRadio) this.setVelToHeli();
+        else if (this.isHomming) this.hommingFn();
+    }
+    setRadio(on, force, pause) {
+        this.isRadio = on;
+        this.forseValue = force;
+        this.pauseTime = pause;
+    }
+    setVelToHeli() {
+        if (!this.visible) return;
+        this.pauseTime -= 1/60;
+        if (this.pauseTime > 0) return;
+        let target = plane ? plane.body.getWorldCenter() : Vec2(0,0);
+        let myPos = this.body.getWorldCenter();
+        let dx = target.x - myPos.x;
+        let dy = target.y - myPos.y;
+        if (dx === 0) dx = 0.001;
+        let a = Math.atan(dy/dx);
+        if (dx < 0) a = -a;
+        if (dx <= 0) a = Math.PI - a;
+        this.vel.x = Math.cos(a) * this.forseValue;
+        this.vel.y = Math.sin(a) * this.forseValue;
+        this.body.setLinearVelocity(Vec2(this.vel.x, this.vel.y));
+        this.body.setTransform(this.body.getPosition(), a + Math.PI);
+    }
+    draw(ctx) {
+        let tex = textures[this.texName];
+        if (!tex) return;
+        let p = this.body.getWorldCenter();
+        let s = this.visible ? this.size : {x:this.size.x*1.5,y:this.size.x*1.5};
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        let a = this.body.getAngle();
+        ctx.rotate(a);
+        ctx.drawImage(tex, -s.x/2, -s.y/2, s.x, s.y);
+        ctx.restore();
+    }
+}
+
+// ============ VEHICLE (base) ============
+class Vehicle {
+    constructor(pos, size) {
+        this.pos = {x:pos[0],y:pos[1]};
+        this.size = {x:size[0],y:size[1]};
+        this.ID = randomID();
+        this.armor = 10;
+        this.exists = true;
+        this.onViewport = false;
+        this.killedByHeli = true;
+        this.angle = 0;
+        this.index = 0;
+        this.stateTime = 0;
+        this.frameTime = 0.1;
+        this.FRAME_COLS = 1;
+        this.FRAME_ROWS = 1;
+        this.faceToLeft = true;
+        this.bulletPos = Vec2(0,0);
+        this.bulletSize = Vec2(0.2,0.2);
+        this.bulletTexture = 'gun_bullet';
+        this.bulletDamage = 1;
+        this.bulArmor = 1;
+        this.bulDamage = 1;
+        this.coins = 1;
+        this.needExhaust = false;
+        this.spriteNames = [];
+        this.currentFrames = null;
+        this.frames = {};
+        this.body = null;
+        this.vertices = [];
+        this.shootInterval = 0.5;
+        this.shootTime = 0;
+        this.exhaustPos = Vec2(0,0);
+    }
+    init(id, type, catBits) {
+        let vs = this.vertices.map(v => [v[0]*this.size.x, v[1]*this.size.y]);
+        this.loadFrames();
+        let bd = new planck.BodyDef();
+        bd.type = planck.Body.Dynamic;
+        bd.position = Vec2(this.pos.x, this.pos.y);
+        bd.allowSleep = true;
+        bd.awake = false;
+        this.body = world.createBody(bd);
+        this.body.setFixedRotation(true);
+        let shape = new planck.PolygonShape();
+        shape.setVertices(vs.map(v=>Vec2(v[0],v[1])));
+        let fd = new planck.FixtureDef();
+        fd.shape = shape;
+        fd.filterCategoryBits = catBits;
+        fd.filterGroupIndex = 1;
+        fd.density = 780;
+        this.body.createFixture(fd).setUserData(new UserData(id, 100, type, ''));
+        this.body.setTransform(Vec2(this.pos.x, this.pos.y), 0);
+        this.FRAME_COLS = 1;
+        this.FRAME_ROWS = 1;
+        this.currentFrames = this.getFrames(0);
+    }
+    loadFrames() {
+        for (let i = 0; i < this.spriteNames.length; i++) {
+            let tex = textures[this.spriteNames[i]];
+            if (tex) this.frames[this.spriteNames[i]] = [tex];
+        }
+    }
+    getFrames(idx) {
+        let name = this.spriteNames[idx];
+        return this.frames[name] || null;
+    }
+    setDamage(d) {
+        if (this.onViewport) this.armor -= d;
+    }
+    getBulletPos() {
+        let p = this.body.getPosition();
+        return Vec2(p.x + this.bulletPos.x, p.y + this.bulletPos.y);
+    }
+    getBulletVel(speed) {
+        return Vec2(speed * Math.cos(this.angle), speed * Math.sin(this.angle));
+    }
+    update(dt) {
+        let cp = camera;
+        let bx = this.body.getPosition().x;
+        if (bx < cp.x - cp.width*0.99) {
+            this.killedByHeli = false;
+            this.exists = false;
+        }
+    }
+    draw(ctx) {
+        if (!this.exists) return;
+        let p = this.body ? this.body.getPosition() : this.pos;
+        if (!p) return;
+        let tex = this.currentFrames ? (this.currentFrames[this.index] || this.currentFrames[0]) : null;
+        if (!tex) {
+            ctx.fillStyle = '#f44';
+            ctx.fillRect(p.x-this.size.x/2, p.y-this.size.y/2, this.size.x, this.size.y);
+            return;
+        }
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        if (!this.faceToLeft) ctx.scale(-1,1);
+        ctx.drawImage(tex, -this.size.x/2, -this.size.y/2, this.size.x, this.size.y);
+        ctx.restore();
+    }
+}
+
+// ============ HELICOPTER ============
+class Hely {
+    constructor(helyIndex) {
+        this.helyIndex = helyIndex || 0;
+        this.exists = true;
+        this.armor = 50;
+        this.fuel = 50;
+        this.maxSpeed = 3.0;
+        this.pos = Vec2(3, 7.34);
+        this.size = Vec2(0,0);
+        this.angle = 0;
+        this.index = 0;
+        this.stateTime = 0;
+        this.frameTime = 0.099;
+        this.FRAME_COLS = 2;
+        this.FRAME_ROWS = 1;
+        this.bulletShootInterval = 1000;
+        this.fuelInterval = 0.9;
+        this.alive = true;
+        this.whipped = false;
+        this.airExplosion = false;
+        this.weaponCounts = [50000, 100, 100, 100, 10, 10];
+        this.sprite = null;
+        this.frames = [];
+        this.airExplosionFrames = [];
+        this.body = null;
+        this.ascensionalPower = 0;
+    }
+    init() {
+        let s = Vec2(lengthUnit*2.35, (lengthUnit*2.35*200)/450);
+        this.size = s;
+        this.pos = Vec2(3, 7.34);
+        let bd = new planck.BodyDef();
+        bd.type = planck.Body.Dynamic;
+        bd.position = this.pos;
+        this.body = world.createBody(bd);
+        this.body.setFixedRotation(true);
+        let vs = [[-0.45,-0.4],[-0.3,0.3],[0.3,0.3],[0.4,-0.4]];
+        vs = vs.map(v=>Vec2(v[0]*s.x, v[1]*s.y));
+        let shape = new planck.PolygonShape();
+        shape.setVertices(vs);
+        let fd = new planck.FixtureDef();
+        fd.shape = shape;
+        fd.filterCategoryBits = CAT_HELICOPTER;
+        fd.filterGroupIndex = 1;
+        fd.density = 10000;
+        fd.friction = 0.5;
+        fd.restitution = 0.471;
+        this.body.createFixture(fd).setUserData(new UserData(0, 10000, '', ''));
+        this.body.setLinearDamping(5.5);
+        this.body.setTransform(this.pos, 0);
+        this.ascensionalPower = -this.body.getMass() * GRAVITY;
+        // Load textures
+        let tex = textures['hely0'] || textures['helicopter1'];
+        if (tex) this.frames = [tex];
+        let expTex = textures['air_explosion2'];
+        if (expTex) this.airExplosionFrames = [expTex];
+        this.sprite = tex;
+        this.body.setTransform(Vec2(3, 7.34), 0);
+    }
+    setVelocity(v) {
+        if (!this.alive) { this.ascensionalPower = 0; return; }
+        this.body.setLinearVelocity(Vec2(v.x, v.y));
+        if (this.fuel > 0) this.setAscensionalPower();
+        else this.body.setTransform(this.body.getPosition(), 0);
+        if (v.x > 0) this.body.setTransform(this.body.getPosition(), (-0.4*Math.abs(v.x))/this.maxSpeed);
+        else if (v.x < 0) this.body.setTransform(this.body.getPosition(), (0.4*Math.abs(v.x))/this.maxSpeed);
+        else this.body.setTransform(this.body.getPosition(), 0);
+    }
+    setVelocityXY(vx, vy) { this.setVelocity(Vec2(vx, vy)); }
+    setAscensionalPower() {
+        if (this.fuel > 0) {
+            this.body.applyForce(Vec2(0, -this.body.getMass() * 0.995 * GRAVITY), this.body.getWorldCenter());
+        }
+    }
+    setDamage(d) { this.armor -= d; }
+    setSupply(type, val) {
+        if (type==='fuel_sup') { this.fuel = Math.min(this.fuel+35, 100); }
+        else if (type==='armor_sup') { this.armor = Math.min(this.armor+25, 100); }
+        else if (type==='bomb_sup') { this.weaponCounts[3] += val; }
+        else if (type==='missl_sup') { this.weaponCounts[1] += 20; }
+        this.weaponUpdate();
+    }
+    shoot(idx) {
+        if (!this.alive) return;
+        let angle = this.body.getAngle();
+        let pos = this.body.getPosition();
+        let s = this.size;
+        let bulPos = Vec2(pos.x + 0.7*s.x, pos.y + 0.05*s.y);
+        let bulVel = Vec2(BULLET_VELS[idx][0]*Math.cos(angle), BULLET_VELS[idx][0]*Math.sin(angle)+BULLET_VELS[idx][1]);
+        let bulSize = BULLET_SIZES[idx];
+        let id = randomID();
+        let tex = BULLET_TEXTS[idx];
+        let arm = BULLET_ARMORS[idx];
+        let dam = BULLET_DAMAGES[idx];
+        this.weaponCounts[idx]--;
+        if (this.weaponCounts[idx]<=0) {}
+        this.bulletShootInterval = 0;
+        let b = new Bullet([bulPos.x,bulPos.y], angle, [bulVel.x,bulVel.y], [bulSize[0]*s.x,bulSize[1]*s.y], [arm,dam], tex, 'fired_bullet', id, BULLET_FRAME_COLS[idx][0], BULLET_FRAME_COLS[idx][1], 0x0040);
+        b.body.setLinearVelocity(Vec2(bulVel.x, bulVel.y));
+        bullets.set(id, b);
+        genBulCount++;
+    if (idx===4) {
+        // Support aircraft
+        let sa = new Vehicle([(camera.x-camH*0.7)-CAM_WIDTH/4, camH*0.75], [4.5*lengthUnit, 1.23*lengthUnit]);
+        sa.spriteNames = ['support_aircraft'];
+        sa.vertices = [[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+        sa.armor = 50;
+        sa.coins = 0;
+        sa.init(sa.ID, 'support', CAT_SUPPORT_AIRCRAFT);
+        vehicles.set(sa.ID, sa);
+        genEnemyCount++;
+    }
+    }
+    weaponUpdate() {}
+    update(dt) {
+        if (this.bulletShootInterval < 1) this.bulletShootInterval += dt;
+        let p = this.body.getPosition();
+        this.pos = Vec2(p.x - this.size.x/2, p.y - this.size.y/2);
+        if (this.armor >= 0) { this.alive = true; this.whipped = false; }
+        else if (!this.airExplosion) {
+            this.airExplosion = true;
+            this.alive = false;
+        }
+        if (this.alive) { this.FRAME_COLS=2; this.FRAME_ROWS=1; }
+        else if (this.airExplosion) { this.FRAME_COLS=9; this.FRAME_ROWS=1; }
+        if (p.y > camH - this.size.y/2) {
+            this.body.setTransform(Vec2(p.x, camH - this.size.y/2), this.body.getAngle());
+        }
+    }
+    draw(ctx, dt) {
+        if (!this.exists) return;
+        this.stateTime += dt;
+        let tex = this.alive ? this.frames[0] : this.airExplosionFrames[0];
+        if (!tex) {
+            // Fallback: draw a colored rectangle
+            let p = this.body.getPosition();
+            ctx.fillStyle = this.alive ? '#0f0' : '#f00';
+            ctx.fillRect(p.x-this.size.x/2, p.y-this.size.y/2, this.size.x, this.size.y);
+            return;
+        }
+        let p = this.body.getPosition();
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        ctx.rotate(this.body.getAngle());
+        ctx.drawImage(tex, -this.size.x/2, -this.size.y/2, this.size.x, this.size.y);
+        ctx.restore();
+    }
+}
+
+// ============ ENEMY TYPES ============
+class SmallRocketV extends Vehicle {
+    constructor(pos, size, type) {
+        super(pos, size);
+        this.spriteNames = ['small_rocket_waiting','small_rocket_flying','air_explosion2'];
+        this.vertices = [[0,0],[0,0.89],[0.99,0.89],[0.99,0]];
+        this.armor = 20;
+        this.coins = 10;
+        this.FRAME_COLS=1; this.FRAME_ROWS=1;
+        this.state = {waiting:true, flying:false, explosion:false};
+        this.bulletType = 0;
+        this.init(this.ID, 'enemy', CAT_ENEMY);
+    }
+    update(dt) {
+        let p = this.body.getPosition();
+        if (p.y > camH) { this.killedByHeli=false; this.exists=false; return; }
+        let cp = camera;
+        if (p.x<cp.x-cp.width*0.8||p.x>cp.x+cp.width*0.5) { this.onViewport=false; return; }
+        this.onViewport = true;
+        if (this.state.explosion) return;
+        if (!this.state.explosion && this.armor<=0) {
+            this.state = {waiting:false,flying:false,explosion:true};
+            this.index=0;
+            return;
+        }
+        if (plane && this.state.waiting && Math.abs(plane.body.getPosition().x-p.x)<camera.width/7) {
+            this.state.waiting=false; this.state.flying=true;
+            this.setVelToHeli();
+        }
+        if (this.state.flying) {
+            this.setVelToHeli();
+            if (p.y > camH*1.4) this.armor -= 10000;
+        }
+    }
+    setVelToHeli() {
+        if (!plane) return;
+        let tp = plane.body.getWorldCenter();
+        let mp = this.body.getWorldCenter();
+        let dx = tp.x-mp.x, dy = tp.y-mp.y;
+        if (dx===0) dx=0.001;
+        let a = Math.atan(dy/dx);
+        if (dx<0) a=-a;
+        if (dx<=0) a = Math.PI - a;
+        this.body.setLinearVelocity(Vec2(Math.cos(a)*2, Math.sin(a)*2));
+        this.body.setTransform(mp, a-Math.PI/2);
+    }
+    draw(ctx) {
+        if (!this.exists) return;
+        let tex = textures[this.spriteNames[this.state.flying?1:0]];
+        if (!tex) { let tex2 = textures['heli_gun_bullet']; if(tex2) {ctx.drawImage(tex2,this.pos.x,this.pos.y,this.size.x,this.size.y);} return; }
+        let p = this.body.getPosition();
+        ctx.drawImage(tex, p.x-this.size.x/2, p.y-this.size.y/2, this.size.x, this.size.y);
+    }
+}
+
+class ArtilleryTowerV extends Vehicle {
+    constructor(pos, size) {
+        super(pos, size);
+        this.spriteNames = ['art_tower1_shooting0','art_tower1_shooting30','air_explosion2','bullet_exhaust'];
+        this.vertices = [[0.2,0],[0.1,0.1],[0.2,0.6],[0.8,0.6],[0.9,0.1],[0.8,0]];
+        this.armor = 20;
+        this.coins = 12;
+        this.shootInterval = 0.515;
+        this.bulDamage = 2;
+        this.bulletTexture = 'gun_bullet';
+        this.bulletSize = Vec2(0.2,0.2);
+        this.bulArmor = 1;
+        this.state = {alive:true,explosion:false};
+        this.init(this.ID, 'enemy', CAT_ENEMY);
+    }
+    update(dt) {
+        let p = this.body.getPosition();
+        let cp = camera;
+        if (p.x<cp.x-cp.width/2-this.size.x||p.x>cp.x+cp.width/2) { this.onViewport=false; return; }
+        this.onViewport=true;
+        if (this.state.explosion) return;
+        if (this.armor<0) {
+            this.state = {alive:false,explosion:true};
+            return;
+        }
+        if (!plane) return;
+        let tp = plane.body.getWorldCenter();
+        if (Math.abs(tp.x-p.x)>=cp.width*0.8) return;
+        let dx=tp.x-p.x, dy=tp.y-p.y;
+        if (dx===0) dx=0.001;
+        let a = Math.atan(dy/dx);
+        if (dx>=0) this.faceToLeft=false; else {a*=-1; this.faceToLeft=true;}
+        this.angle = a;
+        if (this.shootTime>this.shootInterval) {
+            this.shootTime=0;
+            let id=randomID();
+            let vel = this.getBulletVel(11);
+            let bpos = this.getBulletPos();
+            bullets.set(id, new Bullet([bpos.x,bpos.y], this.angle, [vel.x,vel.y], [this.bulletSize.x,this.bulletSize.y], [this.bulArmor,this.bulDamage], this.bulletTexture, 'fired_bullet', id, 1,1,CAT_ENEMY_BULLET));
+        } else this.shootTime+=dt;
+    }
+    draw(ctx) {
+        if (!this.exists) return;
+        let tex = textures[this.state.alive ? this.spriteNames[0] : this.spriteNames[2]];
+        if (!tex) return;
+        let p = this.body.getPosition();
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        if (!this.faceToLeft) ctx.scale(-1,1);
+        ctx.drawImage(tex, -this.size.x/2, -this.size.y/2, this.size.x, this.size.y);
+        ctx.restore();
+    }
+}
+
+class DrivingTank1V extends Vehicle {
+    constructor(pos, size, borders) {
+        super(pos, size);
+        this.spriteNames = ['driving_tank1_running','driving_tank1_shooting0','driving_tank1_shooting30','ground_explosion1','bullet_exhaust'];
+        this.vertices = [[0.3,0],[0.1,0.1],[0.2,0.7],[0.8,0.7],[0.85,0.1],[0.75,0.1]];
+        this.armor = 20;
+        this.coins = 20;
+        this.shootInterval = 0.6;
+        this.bulDamage = 3;
+        this.bulletTexture = 'gun_bullet';
+        this.bulletSize = Vec2(0.3,0.3);
+        this.bulArmor = 1;
+        this.state = {running:true,firing:false,dying:false};
+        this.leftBorder = borders ? borders[0] : pos[0]-1;
+        this.rightBorder = borders ? borders[1] : pos[0]+1;
+        this.goLeft = false;
+        this.init(this.ID, 'enemy', CAT_ENEMY);
+    }
+    update(dt) {
+        let p = this.body.getPosition();
+        let cp = camera;
+        if (p.x<cp.x-cp.width*0.8||p.x>cp.x+cp.width*0.7) { this.onViewport=false; return; }
+        this.onViewport=true;
+        if (this.state.dying) return;
+        if (this.armor<0) {
+            this.state = {running:false,firing:false,dying:true};
+            this.index=0;
+            return;
+        }
+        if (!plane) return;
+        let tp = plane.body.getWorldCenter();
+        if (Math.abs(tp.x-p.x)<cp.width*0.75) {
+            this.state.dying=false; this.state.running=false; this.state.firing=true;
+            let dx=tp.x-p.x, dy=tp.y-p.y;
+            if (dx===0) dx=0.001;
+            let a = Math.atan(dy/dx);
+            if (dx>=0) this.faceToLeft=false; else {a*=-1;this.faceToLeft=true;}
+            this.angle = a;
+            if (this.shootTime>this.shootInterval) {
+                this.shootTime=0;
+                let id=randomID();
+                let vel = this.getBulletVel(11);
+                let bpos = this.getBulletPos();
+                bullets.set(id, new Bullet([bpos.x,bpos.y], this.angle, [vel.x,vel.y], [this.bulletSize.x,this.bulletSize.y], [this.bulArmor,this.bulDamage], this.bulletTexture, 'fired_bullet', id, 1,1,CAT_ENEMY_BULLET));
+            } else this.shootTime+=dt;
+        } else {
+            // patrol
+            if (p.x<this.leftBorder) this.goLeft=false;
+            if (p.x>this.rightBorder) this.goLeft=true;
+            this.body.setLinearVelocity(Vec2(this.goLeft?-1.2:1.2, 0));
+            this.state = {running:true,firing:false,dying:false};
+        }
+    }
+    draw(ctx) {
+        if (!this.exists) return;
+        let tex = textures[this.state.dying?this.spriteNames[3]:this.state.firing?this.spriteNames[1]:this.spriteNames[0]];
+        if (!tex) return;
+        let p = this.body.getPosition();
+        ctx.save();
+        ctx.translate(p.x, p.y);
+        if (!this.faceToLeft) ctx.scale(-1,1);
+        ctx.drawImage(tex, -this.size.x/2, -this.size.y/2, this.size.x, this.size.y);
+        ctx.restore();
+    }
+}
+
+// ============ CREATE ENEMY HELPERS ============
+function createSmallRocket(x, size) {
+    let sr = new SmallRocketV([x, size[1]*0.1], [size[0], size[1]], 0);
+    vehicles.set(sr.ID, sr);
+    genEnemyCount++;
+}
+function createArtilleryTower(x, size) {
+    let at = new ArtilleryTowerV([x, size[1]*0.1], size);
+    vehicles.set(at.ID, at);
+    genEnemyCount++;
+}
+function createDrivingTank(x, size, borders) {
+    let dt = new DrivingTank1V([x, size[1]*0.1], size, borders);
+    vehicles.set(dt.ID, dt);
+    genEnemyCount++;
+}
+function createSmallHeli(x, size) {
+    let v = new Vehicle([x, heightUnit*1], size);
+    v.spriteNames = ['small_heli_flying'];
+    v.exists = true;
+    v.armor = 15;
+    v.coins = 15;
+    v.vertices = [[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+    v.init(v.ID, 'enemy', CAT_ENEMY);
+    vehicles.set(v.ID, v);
+    genEnemyCount++;
+}
+function createAvgHeli(x, size) {
+    let v = new Vehicle([x, heightUnit], size);
+    v.spriteNames = ['avg_heli_flying'];
+    v.armor = 25;
+    v.coins = 20;
+    v.vertices = [[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+    v.init(v.ID, 'enemy', CAT_ENEMY);
+    vehicles.set(v.ID, v);
+    genEnemyCount++;
+}
+function createHeavyHeli(x, size) {
+    let v = new Vehicle([x, heightUnit], size);
+    v.spriteNames = ['heavy_heli_flying'];
+    v.armor = 40;
+    v.coins = 30;
+    v.vertices = [[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+    v.init(v.ID, 'enemy', CAT_ENEMY);
+    vehicles.set(v.ID, v);
+    genEnemyCount++;
+}
+
+// ============ LEVEL ============
+let random = () => Math.random();
+function randomID() {
+    return Math.floor(Math.random()*2147483647) + Math.floor(Math.random()*10090) + Math.floor(Math.random()*1300);
+}
+function getHommingTarget() {
+    for (let [id,v] of vehicles) {
+        if (v.onViewport && v.body && v.body.getWorldCenter().x > (plane?plane.body.getWorldCenter().x-camera.width*0.1:0)) {
+            return v.body.getWorldCenter();
+        }
+    }
+    return Vec2(CAM_WIDTH*1000000, camH/2);
+}
+
+// ============ LEVEL GENERATION ============
+function createGroundBlock() {
+    let length = Math.floor(Math.random()*7) || 1;
+    let height = Math.floor(Math.random()*6)+Math.floor(Math.random()*3)+Math.floor(Math.random()*2) || 1;
+    let prevIdx = heightmap.length;
+    for (let i=0; i<length; i++) {
+        let row = new Array(height).fill(0);
+        groundTilesMap.push(row);
+        let h = height * heightUnit;
+        heightmap.push(h);
+        groundVertices.push(Vec2(worldLength, h));
+        worldLength += lengthUnit;
+        if (heightmap.length>=3) {
+            let mid = heightmap.length-2;
+            let l1 = groundTilesMap[mid-1].length;
+            let l2 = groundTilesMap[mid].length;
+            let l3 = groundTilesMap[mid+1].length;
+            if (l2>=l1 && l2<=l3) {
+                for (let j=0; j<l1; j++) groundTilesMap[mid][j]=2;
+                for (let j=0; j<l2-l1; j++) groundTilesMap[mid][l1+j]=6;
+                groundTilesMap[mid][l1+(l2-l1-1)] = (l2-l1!==0)?5:7;
+            } else if (l2>l1 && l2>l3) {
+                for (let j=l2-2; j>0; j--) {
+                    if (j>l1-1 && j>l3-1) groundTilesMap[mid][j]=3;
+                    else if (j>l1-1 && j<=l3-1) groundTilesMap[mid][j]=6;
+                    else if (j<=l3-1 || j>l1-1) groundTilesMap[mid][j]=0;
+                    else groundTilesMap[mid][j]=9;
+                }
+                groundTilesMap[mid][l2-1]=4;
+            } else if ((l2<=l1 && l2>l3) || (l2<l1 && l2>=l3)) {
+                groundTilesMap[mid][l2-1]=l2>l3?8:7;
+            } else if (l2<l1 && l2<l3) {
+                groundTilesMap[mid][l2-1]=7;
+            }
+        } else if (heightmap.length>=2) {
+            let l1 = groundTilesMap[0].length;
+            let l2 = groundTilesMap[1].length;
+            if (l1>l2) {
+                for (let j=0; j<l1-1; j++) groundTilesMap[0][j]=j<l2?0:9;
+                groundTilesMap[0][l1-1]=8;
+            } else if (l1<l2) {
+                groundTilesMap[0][l1-1]=7;
+            } else groundTilesMap[0][l1-1]=7;
+        }
+        if (heightmap.length>=2) {
+            let idx = heightmap.length-2;
+            if (idx>=0) {
+                let gv1 = groundVertices[idx];
+                let gv2 = groundVertices[idx+1] || groundVertices[idx];
+                // Create ground fixture
+                let shape = new planck.PolygonShape();
+                shape.setVertices([
+                    Vec2(gv1.x, 0),
+                    Vec2(gv1.x, gv1.y),
+                    Vec2(gv2.x, gv1.y),
+                    Vec2(gv2.x, 0)
+                ]);
+                let fd = new planck.FixtureDef();
+                fd.shape = shape;
+                fd.filterCategoryBits = CAT_GROUND;
+                fd.filterGroupIndex = 1;
+                if (box1) box1.createFixture(fd).setUserData(new UserData(0,100000,'ground',''));
+            }
+        }
+    }
+    if (heightmap.length>7 && worldLength-(length*lengthUnit)>12) {
+        createObjectAt(worldLength-(length*lengthUnit), length, heightmap[heightmap.length-1-length]);
+    }
+    finishDistance = worldLength - lengthUnit*2;
+}
+
+function createObjectAt(x, len, y) {
+    let f = x;
+    let f2 = len * lengthUnit;
+    let f3 = y;
+    createSprObj(f, f2, f3);
+    if (Math.floor(Math.random()*6)===4) createSmallAircraft(f);
+    if (f2>=lengthUnit*3) createHeli(f, f2, f3);
+    createBunker(f, f2, f3);
+    createBigRocket(f, f2, f3);
+    createSupply(f, f2, f3);
+    createHorizRocket(f, f2, f3);
+    if (f2<=lengthUnit) {
+        if (Math.floor(Math.random()*2)===1) createSprObj(f, f2, f3);
+        else createSmallRocket((f-f2/2), [0.36*lengthUnit,0.94*lengthUnit]);
+    } else if (f2>lengthUnit && f2<=lengthUnit*2) {
+        if (Math.floor(Math.random()*2)===1) createArtilleryTower(f-f2, [1.5*lengthUnit,0.74*lengthUnit]);
+    } else if (f2<=lengthUnit*3) {
+        if (Math.floor(Math.random()*2)===1) {
+            let v = new Vehicle([(f-f2/2)-0.5*0.6*lengthUnit, f3], [0.6*lengthUnit,0.601*lengthUnit]);
+            vehicles.set(v.ID, v);
+            genEnemyCount++;
+        }
+    } else if (f2>=lengthUnit*4) {
+        let r = Math.floor(Math.random()*5);
+        if (r===1) createDrivingTank((f-f2/2), [1.999*lengthUnit,1.0089*lengthUnit], [1,1]);
+        else if (r===2) {
+            let v = new Vehicle([(f-f2/2)-0.5*1.4*lengthUnit, f3], [1.4*lengthUnit,0.92*lengthUnit]);
+            v.spriteNames = ['truck1_running'];
+            v.armor=10; v.coins=5; v.vertices=[[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+            v.init(v.ID, 'enemy', CAT_ENEMY);
+            vehicles.set(v.ID, v); genEnemyCount++;
+        } else if (r===3) {
+            let v = new Vehicle([(f-f2/2)-0.5*2*lengthUnit, f3], [2*lengthUnit,1.15*lengthUnit]);
+            v.spriteNames = ['truck2_running'];
+            v.armor=15; v.coins=8; v.vertices=[[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+            v.init(v.ID, 'enemy', CAT_ENEMY);
+            vehicles.set(v.ID, v); genEnemyCount++;
+        } else if (r===4) {
+            let v = new Vehicle([(f-f2/2)-0.5*2*lengthUnit, f3], [2*lengthUnit,0.92*lengthUnit]);
+            v.spriteNames = ['jeep_missle_running'];
+            v.armor=8; v.coins=6; v.vertices=[[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+            v.init(v.ID, 'enemy', CAT_ENEMY);
+            vehicles.set(v.ID, v); genEnemyCount++;
+        }
+        if (f2>=lengthUnit*5) {
+            let v = new Vehicle([(f-f2/2)-0.5*3.5*lengthUnit, f3], [3.5*lengthUnit,1.51*lengthUnit]);
+            v.spriteNames = ['mlrs3_running'];
+            v.armor=30; v.coins=25; v.vertices=[[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+            v.init(v.ID, 'enemy', CAT_ENEMY);
+            vehicles.set(v.ID, v); genEnemyCount++;
+        }
+    }
+}
+
+function createSprObj(x, len, y) {
+    let tx = ['tree1','tree2','tree3'][Math.floor(Math.random()*3)];
+    let ix = Math.floor(Math.random()*3);
+    if (ix===0) {
+        let pos = [(x-len)-(1.5*lengthUnit-lengthUnit)/2, y];
+        let img = new ImageButon(pos, [1.5*lengthUnit,1.5*lengthUnit], tx, 1, 1);
+        spriteObjects.push(img);
+    } else if (ix===2 && len>=lengthUnit*3) {
+        let pos = [(x-len)-(1.5*lengthUnit-lengthUnit)/2, y];
+        let img = new ImageButon(pos, [1.5*lengthUnit,1.5*lengthUnit], tx, 1, 1);
+        spriteObjects.push(img);
+    }
+}
+
+function createHeli(x, len, y) {
+    let r = Math.floor(Math.random()*6);
+    if (r===4) createSmallHeli(x-len, [2.9*lengthUnit,1.2*lengthUnit]);
+    else if (r===3) createHeavyHeli(x-len, [2.7*lengthUnit,0.918*lengthUnit]);
+    else if (r===2) createAvgHeli(x-len, [2.1*lengthUnit,0.93*lengthUnit]);
+}
+
+function createBunker(x, len, y) {
+    if (Math.floor(Math.random()*7)===1) {
+        let v = new Vehicle([x-len, y], [1.1*lengthUnit,0.55*lengthUnit]);
+        v.spriteNames = ['small_bunker_alive'];
+        v.armor=50; v.coins=10; v.vertices=[[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+        v.init(v.ID, 'enemy', CAT_ENEMY);
+        vehicles.set(v.ID, v); genEnemyCount++;
+    }
+}
+
+function createBigRocket(x, len, y) {
+    if (Math.floor(Math.random()*4)!==1 || len>lengthUnit*2) return;
+    let v = new Vehicle([(x-len/2)-0.5*0.99*lengthUnit, y*1.4], [0.99*lengthUnit,1.84*lengthUnit]);
+    v.spriteNames = ['big_rocket_waiting'];
+    v.armor=30; v.coins=20; v.vertices=[[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+    v.init(v.ID, 'enemy', CAT_ENEMY);
+    vehicles.set(v.ID, v); genEnemyCount++;
+}
+
+function createSupply(x, len, y) {
+    if (Math.floor(Math.random()*5)!==0) return;
+    let tx = ['fuel_sup','armor_sup','missl_sup'][Math.floor(Math.random()*3)];
+    let s = new Supply([x-len/2, (Math.floor(Math.random()*4)+2)*heightUnit+y], [0.5*lengthUnit,0.5*lengthUnit], tx, 12);
+    supplies.set(s.ID, s);
+}
+
+function createHorizRocket(x, len, y) {
+    if (Math.floor(Math.random()*6)!==4) return;
+    let v = new Vehicle([x-len/2.3, camH*(0.6+Math.floor(Math.random()*4)/10)], [1.55*lengthUnit,0.49*lengthUnit]);
+    v.spriteNames = ['horiz_rocket1'];
+    v.armor=5; v.coins=5; v.vertices=[[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+    v.init(v.ID, 'enemy', CAT_ENEMY);
+    vehicles.set(v.ID, v); genEnemyCount++;
+}
+
+function createSmallAircraft(x) {
+    let v = new Vehicle([x, camH*(0.6+Math.floor(Math.random()*3)/10)], [2.5*lengthUnit,0.94*lengthUnit]);
+    v.spriteNames = ['small_aircraft'];
+    v.armor=10; v.coins=8; v.vertices=[[0,0],[0,0.9],[0.9,0.9],[0.9,0]];
+    v.init(v.ID, 'enemy', CAT_ENEMY);
+    vehicles.set(v.ID, v); genEnemyCount++;
+}
+
+// ============ CONTROLLER ============
+let deltaScreen = 0.003;
+
+function controllerUpdate(dt) {
+    if (totalCrash) return;
+    
+    // Keyboard input for helicopter
+    if (plane && plane.exists && plane.fuel > 0 && !isPause) {
+        let vx = 0, vy = 0;
+        if (keys.left) vx = -plane.maxSpeed;
+        if (keys.right) vx = plane.maxSpeed;
+        if (keys.up) vy = plane.maxSpeed;
+        if (keys.down) vy = -plane.maxSpeed;
+        if (vx !== 0 || vy !== 0) {
+            plane.setVelocity(Vec2(vx, vy));
+        }
+    }
+    
+    // Remove dead vehicles
+    let toRemove = [];
+    for (let [id,v] of vehicles) {
+        if (!v.exists || !v.body) { toRemove.push(id); continue; }
+        v.update(dt);
+        if (v.body && v.onViewport) {
+            let p = v.body.getPosition();
+            let a = v.body.getAngle();
+            if (v.spriteNames && textures[v.spriteNames[0]]) {}
+        }
+    }
+    for (let id of toRemove) {
+        if (vehicles.has(id)) {
+            let v = vehicles.get(id);
+            if (v.body) world.destroyBody(v.body);
+            vehicles.delete(id);
+        }
+    }
+    
+    // Update bullets
+    let bulRemove = [];
+    for (let [id,b] of bullets) {
+        b.update();
+        if (b.died || totalCrash) {
+            if (!b.bodyDel) { world.destroyBody(b.body); b.bodyDel=true; }
+            bulRemove.push(id);
+        }
+    }
+    for (let id of bulRemove) bullets.delete(id);
+    
+    // Update supplies
+    let supRemove = [];
+    for (let [id,s] of supplies) {
+        s.update(dt);
+        if (!s.exists) supRemove.push(id);
+    }
+    for (let id of supRemove) {
+        if (supplies.has(id)) {
+            let s = supplies.get(id);
+            if (s.body) world.destroyBody(s.body);
+            supplies.delete(id);
+        }
+    }
+    
+    // Check plane
+    if (!plane || !plane.exists) return;
+    
+    // Camera follow
+    let cp = camera;
+    if (!isPause) {
+        camera.x += deltaScreen;
+    }
+    
+    let plPos = plane.body.getPosition();
+    let plVel = plane.body.getLinearVelocity();
+    
+    if (plVel.x > 0) {
+        if (cp.x + cp.width/3 < plPos.x + plane.size.x) {
+            camera.x = (plPos.x + plane.size.x) - cp.width/3;
+        }
+    } else if (plVel.x < 0 && cp.x - cp.width/2 > plPos.x - plane.size.x/2) {
+        camera.x = (plPos.x - plane.size.x/2) + cp.width/2;
+    }
+    if (camera.x - cp.width/2 <= 0) camera.x = cp.width/2;
+    if (plPos.x - plane.size.x/2 < camera.x - cp.width/2) {
+        plane.body.setTransform(Vec2((camera.x - cp.width/2) + plane.size.x/2, plPos.y), plane.body.getAngle());
+    }
+    
+    plane.update(dt);
+    plPos = plane.body.getPosition();
+    let plAngle = plane.body.getAngle();
+    
+    // Fuel
+    if (!isPause && !isFinished) {
+        if (plane.fuelInterval <= 1) plane.fuelInterval += dt;
+        else { plane.fuel -= 0.2; plane.fuelInterval = 0; }
+    }
+    
+    // Crash check
+    if ((plane.armor <= 0 || plane.body.getPosition().y < -camH) && !isFinished) {
+        isFinished = true;
+        totalCrash = true;
+        plane.exists = false;
+        setTimeout(() => {
+            // Restart after crash
+            location.reload();
+        }, 3000);
+    }
+    
+    // Survival mode - generate more terrain
+    if (survivalMode && camera.x + camera.width*1.7 > worldLength) {
+        createGroundBlock();
+    }
+}
+
+// ============ RENDERER ============
+function render(ctx, dt) {
+    let w = canvas.width;
+    let h = canvas.height;
+    let scale = w / camera.width;
+    
+    ctx.fillStyle = '#87CEEB';
+    ctx.fillRect(0, 0, w, h);
+    
+    // Transform: world coordinates -> pixel coordinates
+    ctx.save();
+    ctx.translate(w/2, h/2);
+    ctx.scale(scale, scale);
+    ctx.translate(-camera.x, -camera.y);
+    
+    // Background
+    let bgTex = textures['back5'];
+    if (bgTex) {
+        let count = Math.ceil(worldLength / camera.width) + 1;
+        for (let i=0; i<count; i++) {
+            let bx = i * camera.width;
+            if (Math.abs(bx + camera.width/2 - camera.x) <= camera.width) {
+                ctx.drawImage(bgTex, bx, 0, camera.width, camH);
+            }
+        }
+    }
+    
+    // Ground tiles
+    for (let i = Math.floor((camera.x - camera.width/2) / lengthUnit); i < groundTilesMap.length; i++) {
+        if (i < 0) continue;
+        let row = groundTilesMap[i];
+        for (let j=0; j<row.length; j++) {
+            let tileIdx = row[j];
+            let tex = groundTiles[tileIdx !== undefined ? tileIdx : 0];
+            if (tex) {
+                let gx = groundVertices[i] ? groundVertices[i].x : i*lengthUnit;
+                ctx.drawImage(tex, gx, j*heightUnit, lengthUnit, heightUnit);
+            }
+        }
+    }
+    
+    // Sprite objects (trees)
+    for (let obj of spriteObjects) {
+        obj.pos = obj.pos || {x:0,y:0};
+        let tex = textures[obj.texName];
+        if (tex) ctx.drawImage(tex, obj.pos.x, obj.pos.y, obj.size.x, obj.size.y);
+    }
+    
+    // Dynamic blocks
+    for (let db of dynamicBlocks) {
+        if (db.sprite) {
+            let p = db.body.getPosition();
+            ctx.drawImage(db.sprite, p.x-db.size.x/2, p.y-db.size.y/2, db.size.x, db.size.y);
+        }
+    }
+    
+    // Static blocks
+    for (let sb of staticBlocks) {
+        if (sb.tex) {
+            ctx.drawImage(sb.tex, sb.position.x, sb.position.y, sb.size.x, sb.size.y);
+        }
+    }
+    
+    // Vehicles
+    for (let [id,v] of vehicles) {
+        if (v.onViewport) v.draw(ctx);
+    }
+    
+    // Helicopter
+    if (plane && plane.exists) {
+        plane.draw(ctx, dt);
+    }
+    
+    // Bullets
+    for (let [id,b] of bullets) {
+        if (!b.died) b.draw(ctx);
+    }
+    
+    // Supplies
+    for (let [id,s] of supplies) {
+        if (s.exists) s.draw(ctx);
+    }
+    
+    ctx.restore();
+    
+    // HUD
+    if (plane) {
+        // Armor bar
+        ctx.fillStyle = '#333';
+        ctx.fillRect(10, h-40, 150, 15);
+        let armorPct = plane.armor/100;
+        ctx.fillStyle = plane.armor>60?'#0f0':plane.armor>25?'#ff0':'#f00';
+        ctx.fillRect(10, h-40, 150*armorPct, 15);
+        ctx.fillStyle = '#fff';
+        ctx.font = '12px monospace';
+        ctx.fillText('Armor: '+Math.floor(plane.armor), 12, h-29);
+        
+        // Fuel bar
+        ctx.fillStyle = '#333';
+        ctx.fillRect(10, h-20, 150, 15);
+        let fuelPct = plane.fuel/100;
+        ctx.fillStyle = plane.fuel>70?'#0f0':plane.fuel>25?'#ff0':'#f00';
+        ctx.fillRect(10, h-20, 150*fuelPct, 15);
+        ctx.fillText('Fuel: '+Math.floor(plane.fuel), 12, h-9);
+        
+        // Score
+        ctx.fillStyle = '#fff';
+        ctx.font = '20px monospace';
+        ctx.fillText('Score: '+curHpoh, w-200, 30);
+        
+        // Pause indicator
+        if (isPause) {
+            ctx.fillStyle = 'rgba(0,0,0,0.5)';
+            ctx.fillRect(w/2-100, h/2-30, 200, 60);
+            ctx.fillStyle = '#fff';
+            ctx.font = '24px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('PAUSED', w/2, h/2+8);
+            ctx.textAlign = 'left';
+        }
+    }
+}
+
+// ============ INPUT ============
+function setupInput() {
+    canvas = document.getElementById('game');
+    
+    // Mouse/touch for joystick
+    canvas.addEventListener('mousedown', e => {
+        let r = canvas.getBoundingClientRect();
+        let x = (e.clientX - r.left) / r.width * canvas.width;
+        let y = (e.clientY - r.top) / r.height * canvas.height;
+        // Joystick zone: bottom-left
+        let jx = canvas.width * 0.1;
+        let jy = canvas.height * 0.7;
+        let jw = canvas.width * 0.2;
+        let jh = canvas.width * 0.2;
+        if (x>=jx && x<=jx+jw && y>=jy && y<=jy+jh) {
+            joystickActive = true;
+            setJoyPos(x, y, jx, jy, jw, jh);
+        }
+        // Weapon buttons - bottom right
+        let bw = canvas.width * 0.085;
+        let bh = canvas.height * 0.085;
+        let bx = canvas.width * 0.4;
+        let by = canvas.height * 0.03;
+        for (let i=0; i<6; i++) {
+            let wx = canvas.width * (0.9 - i*0.1);
+            if (x>=wx && x<=wx+bw && y>=by && y<=by+bh && plane && plane.weaponCounts[i]>0) {
+                plane.shoot(i);
+            }
+        }
+    });
+    
+    canvas.addEventListener('mousemove', e => {
+        if (!joystickActive) return;
+        let r = canvas.getBoundingClientRect();
+        let x = (e.clientX - r.left) / r.width * canvas.width;
+        let y = (e.clientY - r.top) / r.height * canvas.height;
+        let jx = canvas.width * 0.1;
+        let jy = canvas.height * 0.7;
+        let jw = canvas.width * 0.2;
+        let jh = canvas.width * 0.2;
+        setJoyPos(x, y, jx, jy, jw, jh);
+    });
+    
+    window.addEventListener('mouseup', () => {
+        if (joystickActive) {
+            joystickActive = false;
+            resetJoy();
+        }
+    });
+    
+    // Touch
+    canvas.addEventListener('touchstart', e => {
+        e.preventDefault();
+        let touch = e.touches[0];
+        let r = canvas.getBoundingClientRect();
+        let x = (touch.clientX - r.left) / r.width * canvas.width;
+        let y = (touch.clientY - r.top) / r.height * canvas.height;
+        let jx = canvas.width * 0.1;
+        let jy = canvas.height * 0.7;
+        let jw = canvas.width * 0.2;
+        let jh = canvas.width * 0.2;
+        if (x>=jx && x<=jx+jw && y>=jy && y<=jy+jh) {
+            joystickActive = true;
+            joystickPointer = touch.identifier;
+            setJoyPos(x, y, jx, jy, jw, jh);
+        }
+    });
+    
+    canvas.addEventListener('touchmove', e => {
+        e.preventDefault();
+        if (!joystickActive) return;
+        for (let touch of e.touches) {
+            if (touch.identifier === joystickPointer) {
+                let r = canvas.getBoundingClientRect();
+                let x = (touch.clientX - r.left) / r.width * canvas.width;
+                let y = (touch.clientY - r.top) / r.height * canvas.height;
+                let jx = canvas.width * 0.1;
+                let jy = canvas.height * 0.7;
+                let jw = canvas.width * 0.2;
+                let jh = canvas.width * 0.2;
+                setJoyPos(x, y, jx, jy, jw, jh);
+            }
+        }
+    });
+    
+    canvas.addEventListener('touchend', e => {
+        e.preventDefault();
+        if (joystickActive) {
+            joystickActive = false;
+            resetJoy();
+        }
+    });
+    
+    // Keyboard
+    window.addEventListener('keydown', e => {
+        if (e.key === 'ArrowUp') keys.up = true;
+        if (e.key === 'ArrowDown') keys.down = true;
+        if (e.key === 'ArrowLeft') keys.left = true;
+        if (e.key === 'ArrowRight') keys.right = true;
+        if (e.key === ' ') { e.preventDefault(); if (plane) plane.shoot(0); }
+        if (e.key === '1') { if (plane) plane.shoot(0); }
+        if (e.key === '2') { if (plane) plane.shoot(1); }
+        if (e.key === '3') { if (plane) plane.shoot(2); }
+        if (e.key === '4') { if (plane) plane.shoot(3); }
+        if (e.key === '5') { if (plane) plane.shoot(4); }
+        if (e.key === '6') { if (plane) plane.shoot(5); }
+        if (e.key === 'p') togglePause();
+    });
+    
+    window.addEventListener('keyup', e => {
+        if (e.key === 'ArrowUp') keys.up = false;
+        if (e.key === 'ArrowDown') keys.down = false;
+        if (e.key === 'ArrowLeft') keys.left = false;
+        if (e.key === 'ArrowRight') keys.right = false;
+    });
+}
+
+function setJoyPos(x, y, jx, jy, jw, jh) {
+    let cx = jx + jw/2;
+    let cy = jy + jh/2;
+    let dx = x - cx;
+    let dy = y - cy;
+    let dist = Math.sqrt(dx*dx + dy*dy);
+    let maxDist = jw/2;
+    if (dist > maxDist) {
+        dx = dx/dist * maxDist;
+        dy = dy/dist * maxDist;
+    }
+    joyAngle = Math.atan2(dy, dx);
+    if (plane && plane.fuel > 0) {
+        let speed = (plane.maxSpeed * dist) / maxDist;
+        plane.setVelocity(Vec2(Math.cos(joyAngle)*speed, Math.sin(joyAngle)*speed));
+    }
+}
+
+function resetJoy() {
+    if (plane) plane.setVelocity(Vec2(0, 0));
+}
+
+function togglePause() {
+    isPause = !isPause;
+}
+
+// ============ INIT WORLD ============
+function initWorld() {
+    camH = camera.width * (canvas.height / canvas.width);
+    camera.height = camH;
+    camera.y = camH/2;
+    
+    lengthUnit = CAM_WIDTH / 10;
+    heightUnit = (lengthUnit * canvas.height / canvas.width * 10) / 16;
+    
+    // Ground static body
+    let bd = new planck.BodyDef();
+    bd.type = planck.Body.Static;
+    box1 = world.createBody(bd);
+    
+    // Left boundary wall
+    let shape = new planck.PolygonShape();
+    shape.setVertices([
+        Vec2(-camH, -camH),
+        Vec2(-camH, camH*2.97),
+        Vec2(-camH*0.9, camH*2.97),
+        Vec2(-camH*0.9, -camH)
+    ]);
+    let fd = new planck.FixtureDef();
+    fd.shape = shape;
+    fd.filterCategoryBits = CAT_GROUND;
+    fd.filterGroupIndex = 1;
+    box1.createFixture(fd).setUserData(new UserData(0,100000,'ground',''));
+    
+    // Top boundary
+    shape = new planck.PolygonShape();
+    shape.setVertices([
+        Vec2(-camH, camH*1.96),
+        Vec2(-camH, camH*2.97),
+        Vec2(CAM_WIDTH*100, camH*2.97),
+        Vec2(CAM_WIDTH*100, camH*1.96)
+    ]);
+    fd = new planck.FixtureDef();
+    fd.shape = shape;
+    fd.filterCategoryBits = CAT_GROUND;
+    fd.filterGroupIndex = 1;
+    box1.createFixture(fd).setUserData(new UserData(0,100000,'ground',''));
+    
+    // Setup initial ground data
+    worldLength = 0;
+    groundTilesMap = [];
+    groundVertices = [];
+    heightmap = [];
+    
+    // Load ground tiles
+    for (let name of GROUND_TILE_NAMES) {
+        groundTiles.push(textures[name] || null);
+    }
+    
+    // Generate initial terrain
+    for (let i=0; i<8; i++) createGroundBlock();
+    
+    // Create helicopter
+    plane = new Hely(0);
+    plane.size = Vec2(lengthUnit*2.35, (lengthUnit*2.35*200)/450);
+    plane.init();
+    plane.body.setTransform(Vec2(3, 7.34), 0);
+    plane.armor = 100;
+    plane.fuel = 100;
+    
+    isPause = false;
+}
+
+// ============ GAME LOOP ============
+function gameLoop(timestamp) {
+    let dt = 1/60;
+    
+    if (!isPause) {
+        world.step(dt, 6, 2);
+        controllerUpdate(dt);
+    }
+    
+    // Clear and render
+    ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = false;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    
+    render(ctx, dt);
+    
+    // Draw joystick
+    let jx = canvas.width * 0.1;
+    let jy = canvas.height * 0.7;
+    let jw = canvas.width * 0.2;
+    let jh = canvas.width * 0.2;
+    ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(jx+jw/2, jy+jh/2, jw/2, 0, Math.PI*2);
+    ctx.stroke();
+    if (joystickActive) {
+        ctx.fillStyle = 'rgba(255,255,255,0.5)';
+        ctx.beginPath();
+        ctx.arc(jx+jw/2+Math.cos(joyAngle)*(jw/3), jy+jh/2+Math.sin(joyAngle)*(jw/3), 8, 0, Math.PI*2);
+        ctx.fill();
+    }
+    
+    // Draw weapon buttons
+    let bw = canvas.width * 0.07;
+    let bh = canvas.width * 0.07;
+    let by = canvas.height * 0.03;
+    let icons = ['big_gun_icon','big_missile_icon','homming_missile_icon','small_bomb_icon','air_support_icon','super_bomb_icon'];
+    for (let i=0; i<6; i++) {
+        let wx = canvas.width * 0.9 - i * (bw + 5);
+        let tex = textures[icons[i]];
+        if (tex && plane && plane.weaponCounts[i]>0) {
+            ctx.drawImage(tex, wx, by, bw, bh);
+            ctx.fillStyle = '#fff';
+            ctx.font = '10px monospace';
+            ctx.fillText(plane.weaponCounts[i], wx+bw/2-10, by+bh+12);
+        }
+    }
+    
+    if (loaded) requestAnimationFrame(gameLoop);
+}
+
+// ============ COLLISION LISTENER ============
+world.on('begin-contact', function(contact) {
+    let fa = contact.getFixtureA();
+    let fb = contact.getFixtureB();
+    let udA = fa.getUserData();
+    let udB = fb.getUserData();
+    if (!udA || !udB) return;
+    
+    let catA = fa.getFilterCategoryBits();
+    let catB = fb.getFilterCategoryBits();
+    
+    // Disable same-type & friendly-fire collisions
+    if (catA === catB) { contact.setEnabled(false); return; }
+    if ((catA===CAT_ENEMY && catB===CAT_ENEMY_BULLET) || (catA===CAT_ENEMY_BULLET && catB===CAT_ENEMY)) { contact.setEnabled(false); return; }
+    if ((catA===CAT_HELICOPTER && catB===CAT_PLAYER_BULLET) || (catA===CAT_PLAYER_BULLET && catB===CAT_HELICOPTER)) { contact.setEnabled(false); return; }
+    
+    // Helicopter collisions
+    if (catA === CAT_HELICOPTER) {
+        if (catB === CAT_GROUND && plane) { plane.armor -= 100000; }
+        else if (catB === CAT_ENEMY_BULLET && plane) {
+            let bul = findBullet(udB.index);
+            if (bul) bul.setVisible(false);
+            plane.setDamage(udB?udB.damage:5);
+        }
+        else if (catB === CAT_ENEMY && plane) { plane.setDamage(100000); setDamageByID(udB.index, 100000); }
+        else if (catB === CAT_SUPPLY && plane) {
+            let sup = supplies.get(udB.index);
+            if (sup) { plane.setSupply(sup.type, sup.val); sup.exists=false; }
+        }
+    }
+    if (catB === CAT_HELICOPTER) {
+        if (catA === CAT_GROUND && plane) { plane.armor -= 100000; }
+        else if (catA === CAT_ENEMY_BULLET && plane) {
+            let bul = findBullet(udA.index);
+            if (bul) bul.setVisible(false);
+            plane.setDamage(udA?udA.damage:5);
+        }
+        else if (catA === CAT_ENEMY && plane) { plane.setDamage(100000); setDamageByID(udA.index, 100000); }
+        else if (catA === CAT_SUPPLY && plane) {
+            let sup = supplies.get(udA.index);
+            if (sup) { plane.setSupply(sup.type, sup.val); sup.exists=false; }
+        }
+    }
+    
+    // Player bullets vs ground
+    if (catA === CAT_PLAYER_BULLET && catB === CAT_GROUND) {
+        let bul = findBullet(udA.index); if (bul) bul.setVisible(false);
+    }
+    if (catB === CAT_PLAYER_BULLET && catA === CAT_GROUND) {
+        let bul = findBullet(udB.index); if (bul) bul.setVisible(false);
+    }
+    
+    // Player bullets vs enemies
+    if (catA === CAT_PLAYER_BULLET && catB === CAT_ENEMY) {
+        let bul = findBullet(udA.index); if (bul) bul.setVisible(false);
+        setDamageByID(udB.index, udA?udA.damage:1);
+        firedBulCount++;
+    }
+    if (catB === CAT_PLAYER_BULLET && catA === CAT_ENEMY) {
+        let bul = findBullet(udB.index); if (bul) bul.setVisible(false);
+        setDamageByID(udA.index, udB?udB.damage:1);
+        firedBulCount++;
+    }
+    
+    // Enemy bullets vs ground
+    if (catA === CAT_ENEMY_BULLET && catB === CAT_GROUND) {
+        let bul = findBullet(udA.index); if (bul) bul.setVisible(false);
+    }
+    if (catB === CAT_ENEMY_BULLET && catA === CAT_GROUND) {
+        let bul = findBullet(udB.index); if (bul) bul.setVisible(false);
+    }
+    
+    // Support aircraft (cat 7) collisions
+    if (catA === CAT_SUPPORT_AIRCRAFT && catB === CAT_ENEMY) {
+        setDamageByID(udB.index, 100);
+    }
+    if (catB === CAT_SUPPORT_AIRCRAFT && catA === CAT_ENEMY) {
+        setDamageByID(udA.index, 100);
+    }
+    
+    // Bullet vs bullet
+    if ((catA===CAT_PLAYER_BULLET && catB===CAT_ENEMY_BULLET) || (catA===CAT_ENEMY_BULLET && catB===CAT_PLAYER_BULLET)) {
+        contact.setEnabled(false);
+        let bulA = findBullet(udA.index); if (bulA) bulA.setDamage(udB?udB.damage:1);
+        let bulB = findBullet(udB.index); if (bulB) bulB.setDamage(udA?udA.damage:1);
+    }
+});
+
+function findBullet(id) {
+    for (let [bid, b] of bullets) if (bid === id) return b;
+    return null;
+}
+
+function setDamageByID(id, damage) {
+    for (let [vid, v] of vehicles) {
+        if (v.ID === id) { v.setDamage(damage); break; }
+    }
+}
+
+// Extend Hely with setGroundExplosion
+Hely.prototype.setGroundExplosion = function() {
+    this.armor -= 100000;
+};
+
+// ============ MAIN INIT ============
+async function init() {
+    canvas = document.getElementById('game');
+    ctx = canvas.getContext('2d');
+    
+    function resize() {
+        let dpr = window.devicePixelRatio || 1;
+        canvas.width = window.innerWidth * dpr;
+        canvas.height = window.innerHeight * dpr;
+        if (ctx) ctx.imageSmoothingEnabled = false;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+    
+    let loading = document.getElementById('loading');
+    
+    try {
+        loading.textContent = 'Loading textures (serve via http, not file://)...';
+        
+        let baseAssets = 'resources/assets/data';
+        
+        await loadAtlas(baseAssets + '/airplane_textures/airplane_textures1080/airplane_textures1080.atlas', 'airplane');
+        await loadAtlas(baseAssets + '/enemies_textures/enemies_textures1080/enemies_textures1080.atlas', 'enemies');
+        await loadAtlas(baseAssets + '/control_icons/control_icons1080/control_icons1080.atlas', 'controls');
+        
+        loading.textContent = 'Initializing world...';
+        
+        initWorld();
+        setupInput();
+        
+        loaded = true;
+        gameState = 'playing';
+        loading.style.display = 'none';
+        
+        requestAnimationFrame(gameLoop);
+    } catch (e) {
+        loading.innerHTML = 'Error: ' + e.message + '<br>Run via: <b>npx serve .</b> or <b>python -m http.server</b><br>Check F12 console for details.';
+        console.error(e);
+    }
+}
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>
